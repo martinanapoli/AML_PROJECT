@@ -790,3 +790,225 @@ def run_fusion_experiments(fusion_configs):
             num_outputs=num_outputs,
             task_type=task_type,
         )
+
+
+EMBED_DIR = os.path.join(RESULTS_DIR, "embeddings")
+os.makedirs(EMBED_DIR, exist_ok=True)
+
+
+def build_feature_extractor_for_encoder(encoder_name, encoder_path):
+   
+    if encoder_name.startswith("PT2"):
+        # PT2: use the inpainting encoder classifier and turn it into a feature extractor
+        print(f"\n[Embeddings] Loading PT2 feature extractor from: {encoder_path}")
+        model = PT2InpaintingEncoderClassifier(num_outputs=2)  # dummy output size
+        state = torch.load(encoder_path, map_location="cpu")
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print("   Missing keys:", missing)
+        print("   Unexpected keys:", unexpected)
+        # Replace fc by Identity to return 512-d features
+        model.fc = nn.Identity()
+    else:
+        # PT1/PT3: standard ResNet18
+        print(f"\n[Embeddings] Loading PT1/PT3 feature extractor from: {encoder_path}")
+        model = resnet18(weights=None)
+        state = torch.load(encoder_path, map_location="cpu")
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print("   Missing keys:", missing)
+        print("   Unexpected keys:", unexpected)
+        # Replace fc by Identity → 512-d output
+        model.fc = nn.Identity()
+
+    return model.to(DEVICE)
+
+
+def extract_embeddings_for_encoder(encoder_name,
+                                   encoder_path,
+                                   label_type="binary",
+                                   max_samples=5000):
+   
+    print(f"\n Extracting embeddings | Encoder: {encoder_name} | label_type: {label_type}")
+
+    # Use only the test split
+    _, _, test_loader = make_loaders(label_type)
+
+    model = build_feature_extractor_for_encoder(encoder_name, encoder_path)
+    model.eval()
+
+    all_feats = []
+    all_labels = []
+    n_seen = 0
+
+    with torch.no_grad():
+        for imgs, labels in test_loader:
+            imgs = imgs.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            feats = model(imgs)        # (B, 512)
+            feats = feats.detach().cpu().numpy()
+            labels = labels.detach().cpu().numpy()
+
+            all_feats.append(feats)
+            all_labels.append(labels)
+
+            n_seen += feats.shape[0]
+            if max_samples is not None and n_seen >= max_samples:
+                break
+
+    feats = np.concatenate(all_feats)  # (N, 512)
+    labels = np.concatenate(all_labels)
+    if max_samples is not None and feats.shape[0] > max_samples:
+        feats = feats[:max_samples]
+        labels = labels[:max_samples]
+
+    print(f" Extracted embeddings: {feats.shape[0]} samples, dim = {feats.shape[1]}")
+
+    # Save to disk
+    npz_path = os.path.join(EMBED_DIR, f"{encoder_name}_embeddings.npz")
+    np.savez(npz_path, features=feats, labels=labels)
+    print(f" Saved embeddings to: {npz_path}")
+
+    # t-SNE 2D
+    print(" Running t-SNE (2D)...")
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    feats_2d = tsne.fit_transform(feats)
+
+    # Plot
+    plt.figure(figsize=(6, 5))
+    # Binary labels: 0 = normal, 1 = anomaly
+    normal_idx = labels == 0
+    anomaly_idx = labels == 1
+
+    plt.scatter(feats_2d[normal_idx, 0], feats_2d[normal_idx, 1],
+                alpha=0.5, label="No Finding")
+    plt.scatter(feats_2d[anomaly_idx, 0], feats_2d[anomaly_idx, 1],
+                alpha=0.5, label="Anomaly", marker="x")
+    plt.title(f"t-SNE embeddings - {encoder_name}")
+    plt.legend()
+    plt.tight_layout()
+
+    tsne_path = os.path.join(EMBED_DIR, f"{encoder_name}_tsne.png")
+    plt.savefig(tsne_path)
+    plt.close()
+    print(f"   Saved t-SNE plot to: {tsne_path}")
+
+    # Cluster separability metrics (in original 512-d space)
+    sil = silhouette_score(feats, labels)
+    db = davies_bouldin_score(feats, labels)
+    print(f"   Silhouette score: {sil:.4f}")
+    print(f"   Davies-Bouldin:  {db:.4f}")
+
+    return {
+        "encoder_name": encoder_name,
+        "silhouette": sil,
+        "davies_bouldin": db,
+        "num_samples": int(feats.shape[0]),
+    }
+
+
+def analyze_embeddings_for_all_encoders(encoders_list):
+
+    import csv
+
+    csv_path = os.path.join(EMBED_DIR, "embedding_metrics.csv")
+    fieldnames = ["encoder_name", "silhouette", "davies_bouldin", "num_samples"]
+
+    all_rows = []
+
+    for enc_name, enc_path in encoders_list:
+        metrics = extract_embeddings_for_encoder(
+            encoder_name=enc_name,
+            encoder_path=enc_path,
+            label_type="binary",
+            max_samples=5000,
+        )
+        all_rows.append(metrics)
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow(row)
+
+    print(f"\nEmbedding metrics saved to: {csv_path}")
+
+# EXPERIMENTS FOR MULTIPLE ENCODERS --> NOT USED HERE
+
+if __name__ == "__main__":
+    # List of individual encoders (these .pth files are created by prepare_encoders.py)
+    encoders = [
+        ("PT1_D1", os.path.join(MODELS_DIR, "PT1_D1_encoder_only.pth")),
+        ("PT1_D2", os.path.join(MODELS_DIR, "PT1_D2_encoder_only.pth")),
+        ("PT1_D3", os.path.join(MODELS_DIR, "PT1_D3_encoder_only.pth")),
+        ("PT2_D1", os.path.join(MODELS_DIR, "PT2_D1_encoder_only.pth")),
+        ("PT2_D2", os.path.join(MODELS_DIR, "PT2_D2_encoder_only.pth")),
+        ("PT2_D3", os.path.join(MODELS_DIR, "PT2_D3_encoder_only.pth")),
+        ("PT3_D1", os.path.join(MODELS_DIR, "PT3_D1_encoder_only.pth")),
+        ("PT3_D2", os.path.join(MODELS_DIR, "PT3_D2_encoder_only.pth")),
+        ("PT3_D3", os.path.join(MODELS_DIR, "PT3_D3_encoder_only.pth")),
+    ]
+
+    task_configs = [
+        ("binary", 2, "ce"), # 0: No Finding, 1: Anomaly
+        ("3cls", 3, "ce"),  # 0: No Finding, 1: Pneumonia, 2: Other
+        ("multilabel", num_diseases, "bce"),  # vector multi-label
+    ]
+
+    for enc_name, enc_path in encoders:
+        for label_type, num_outputs, task_type in task_configs:
+
+            # Linear probe
+            _ = train_linear_probe(
+                encoder_name=enc_name,
+                encoder_path=enc_path,
+                label_type=label_type,
+                num_outputs=num_outputs,
+                task_type=task_type,
+            )
+
+            # Fine-tuning
+            _ = train_finetune(
+                encoder_name=enc_name,
+                encoder_path=enc_path,
+                label_type=label_type,
+                num_outputs=num_outputs,
+                task_type=task_type,
+            )
+
+    analyze_embeddings_for_all_encoders(encoders)
+
+    fusion_configs = [
+        (
+            "FUSION_PT1_PT2_D3",
+            [
+                ("PT1_D3", os.path.join(MODELS_DIR, "PT1_D3_encoder_only.pth")),
+                ("PT2_D3", os.path.join(MODELS_DIR, "PT2_D3_encoder_only.pth")),
+            ],
+        ),
+        (
+            "FUSION_PT1_PT3_D3",
+            [
+                ("PT1_D3", os.path.join(MODELS_DIR, "PT1_D3_encoder_only.pth")),
+                ("PT3_D3", os.path.join(MODELS_DIR, "PT3_D3_encoder_only.pth")),
+            ],
+        ),
+        (
+            "FUSION_PT2_PT3_D3",
+            [
+                ("PT2_D3", os.path.join(MODELS_DIR, "PT2_D3_encoder_only.pth")),
+                ("PT3_D3", os.path.join(MODELS_DIR, "PT3_D3_encoder_only.pth")),
+            ],
+        ),
+        (
+            "FUSION_PT1_PT2_PT3_D3",
+            [
+                ("PT1_D3", os.path.join(MODELS_DIR, "PT1_D3_encoder_only.pth")),
+                ("PT2_D3", os.path.join(MODELS_DIR, "PT2_D3_encoder_only.pth")),
+                ("PT3_D3", os.path.join(MODELS_DIR, "PT3_D3_encoder_only.pth")),
+            ],
+        ),
+    ]
+
+    run_fusion_experiments(fusion_configs)
+
+    print("Pretext encoder experiments (individual and fused) completed for all downstream tasks.")
