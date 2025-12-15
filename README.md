@@ -3,7 +3,7 @@
 _Analyzing the role of pretraining data, induced invariances and pretext-task fusions._
 
 Self-supervised learning (SSL) learns visual representations without manual labels using pretext tasks. However, different pretext tasks impose different inductive biases and invariances (texture/appearance, spatial context, global structure) which can strongly impact transfer performance.
-This project systematically evaluates which factors make a pretext task useful for downstream anomaly-related classification in chest X-rays:
+This project systematically evaluates which factors make a pretext task useful for downstream anomaly-related classification in chest X-rays :
 - **(H1)** Is visual similarity between pretraining and downstream data enough to explain transfer performance, or does the induced invariance matter equally (or more)?
 - **(H2)** Can we improve downstream results by combining complementary invariances, using multi-encoder feature fusion?
   
@@ -50,7 +50,7 @@ All pretext tasks use a **ResNet18** backbone and are trained **independently** 
 
 - **PT3 — Structural consistency (binary classification)**  
   Binary classification of whether an image is **structurally consistent** or **structurally corrupted**  
-  (e.g., flips, half swaps, quadrant shuffling, strong rotations).  
+  (flips, half swaps, quadrant shuffling, strong rotations...)
   This task emphasizes **global structure** and **anatomical composition**.
 
 ### Encoder-only checkpoint extraction
