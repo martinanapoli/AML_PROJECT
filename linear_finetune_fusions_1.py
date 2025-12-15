@@ -6,6 +6,7 @@ import pandas as pd
 from glob import glob
 from PIL import Image
 import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -15,13 +16,15 @@ from torchvision.models import resnet18
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
+
+
 PROJECT_ROOT = "/Users/martu/Desktop/machine_project"
 
 ROOT_DIR = os.path.join(PROJECT_ROOT, "ChestX")
 IMAGES_DIRS = [os.path.join(ROOT_DIR, f"images_{i:03d}", "images") for i in range(1, 9)]
 CSV_PATH = "/Users/martu/Desktop/machine_project/ChestX/Data_Entry_2017.csv"
 
-RESULTS_DIR = "/Users/martu/Desktop/machine_project/RESULTS_fusiones"
+RESULTS_DIR = "/Users/martu/Desktop/machine_project/RESULTS_fusiones_1"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 MODELS_DIR = "/Users/martu/Desktop/machine_project/encoders_ptx"
@@ -33,7 +36,6 @@ NUM_EPOCHS_FINETUNE = 5
 LR_LINEAR = 1e-3
 LR_ENCODER = 1e-5
 LR_HEAD = 1e-4
-
 
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
@@ -47,9 +49,7 @@ print("CUDA available:", torch.cuda.is_available())
 print("CUDA device_count:", torch.cuda.device_count())
 print("MPS available:", torch.backends.mps.is_available())
 
-
 assert os.path.exists(CSV_PATH), f"CSV path does not exist: {CSV_PATH}"
-
 
 
 df = pd.read_csv(CSV_PATH)
@@ -91,7 +91,6 @@ val_df, test_df = train_test_split(
     stratify=temp_df["label_binary"],
     random_state=42,
 )
-
 
 # DATASET + LOADERS
 
@@ -174,24 +173,52 @@ class PT2InpaintingEncoderClassifier(nn.Module):
         x = self.fc(x)
         return x
 
-def build_feature_extractor_for_encoder(encoder_name, encoder_path):
+# ADAPT conv1 1-channel -> 3-channel (PT3 issue)
+
+
+def _adapt_conv1_weight_if_needed(state_dict, model, conv_key_candidates=("conv1.weight", "layer0.0.weight")):
    
+    key = None
+    named_params = dict(model.named_parameters())
+    for k in conv_key_candidates:
+        if k in state_dict and k in named_params:
+            key = k
+            break
+
+    if key is None:
+        return state_dict
+
+    w_ckpt = state_dict[key]
+    w_model = model.state_dict().get(key, None)
+    if w_model is None:
+        return state_dict
+
+    if w_ckpt.ndim == 4 and w_model.ndim == 4:
+        if w_ckpt.shape[1] == 1 and w_model.shape[1] == 3:
+            state_dict[key] = w_ckpt.repeat(1, 3, 1, 1) / 3.0
+
+    return state_dict
+
+def build_feature_extractor_for_encoder(encoder_name, encoder_path):
+    
     print(f"[Fusion] Loading feature extractor: {encoder_name} from {encoder_path}")
     assert os.path.exists(encoder_path), f"Missing checkpoint: {encoder_path}"
 
+    state = torch.load(encoder_path, map_location="cpu")
+
     if encoder_name.startswith("PT2"):
-        model = PT2InpaintingEncoderClassifier(num_outputs=2)  # dummy
-        state = torch.load(encoder_path, map_location="cpu")
+        model = PT2InpaintingEncoderClassifier(num_outputs=2)  # dummy head
+        state = _adapt_conv1_weight_if_needed(state, model, conv_key_candidates=("layer0.0.weight", "conv1.weight"))
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print("   Missing keys:", missing)
-        print("   Unexpected keys:", unexpected)
+        print(" Missing keys:", missing)
+        print(" Unexpected keys:", unexpected)
         model.fc = nn.Identity()
     else:
         model = resnet18(weights=None)
-        state = torch.load(encoder_path, map_location="cpu")
+        state = _adapt_conv1_weight_if_needed(state, model, conv_key_candidates=("conv1.weight",))
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print("   Missing keys:", missing)
-        print("   Unexpected keys:", unexpected)
+        print(" Missing keys:", missing)
+        print(" Unexpected keys:", unexpected)
         model.fc = nn.Identity()
 
     return model.to(DEVICE)
@@ -301,7 +328,6 @@ def save_confusion_matrix_plot(cm, classes, filename_prefix, title):
     plt.close()
     print(f"Saved confusion matrix: {path}")
 
-
 # FUSION MODEL
 
 class MultiEncoderFusion(nn.Module):
@@ -322,18 +348,17 @@ class MultiEncoderFusion(nn.Module):
         z = torch.cat(feats, dim=1)
         return self.head(z)
 
-# TRAIN: LINEAR-FUSION + FINETUNE-FUSION + SAVE
+# TRAIN: LINEAR-FUSION + FINETUNE-FUSION + SAVE 
 
 def run_one_fusion(fusion_name, encoder_specs):
     label_type = "binary"
     classes = ["No Finding", "Anomaly"]
 
     train_loader, val_loader, test_loader = make_binary_loaders()
-
     criterion = nn.CrossEntropyLoss()
 
     # LINEAR FUSION (frozen encoders)
-    print(f"\n LINEAR FUSION: {fusion_name} ")
+    print(f"\nLINEAR FUSION: {fusion_name}")
     model = MultiEncoderFusion(encoder_specs, num_outputs=2, freeze_encoders=True).to(DEVICE)
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR_LINEAR)
 
@@ -364,12 +389,15 @@ def run_one_fusion(fusion_name, encoder_specs):
     save_training_history(history, f"{fusion_name}_{label_type}_linear_fusion")
 
     te_loss, te_acc, te_f1 = eval_epoch_ce(model, test_loader, criterion)
-    print(f" [LinearFusion TEST] loss {te_loss:.4f} acc {te_acc:.4f} f1 {te_f1:.4f}")
+    print(f"[LinearFusion TEST] loss {te_loss:.4f} acc {te_acc:.4f} f1 {te_f1:.4f}")
 
     preds, targets = get_predictions_ce(model, test_loader)
     cm = confusion_matrix(targets, preds)
-    save_confusion_matrix_plot(cm, classes, f"{fusion_name}_{label_type}_linear_fusion",
-                               f"Confusion Matrix - {fusion_name} (Linear Fusion)")
+    save_confusion_matrix_plot(
+        cm, classes,
+        f"{fusion_name}_{label_type}_linear_fusion",
+        f"Confusion Matrix - {fusion_name} (Linear Fusion)"
+    )
 
     ckpt_path_linear = os.path.join(RESULTS_DIR, f"{fusion_name}_linear_fusion_best.pth")
     torch.save(model.state_dict(), ckpt_path_linear)
@@ -383,9 +411,8 @@ def run_one_fusion(fusion_name, encoder_specs):
         "test_f1": te_f1,
     }
 
-
     # FINETUNE FUSION (train encoders + head)
-    print(f"\nFINETUNE FUSION: {fusion_name} ")
+    print(f"\nFINETUNE FUSION: {fusion_name}")
     model = MultiEncoderFusion(encoder_specs, num_outputs=2, freeze_encoders=False).to(DEVICE)
 
     encoder_params, head_params = [], []
@@ -431,8 +458,11 @@ def run_one_fusion(fusion_name, encoder_specs):
 
     preds, targets = get_predictions_ce(model, test_loader)
     cm = confusion_matrix(targets, preds)
-    save_confusion_matrix_plot(cm, classes, f"{fusion_name}_{label_type}_finetune_fusion",
-                               f"Confusion Matrix - {fusion_name} (Finetune Fusion)")
+    save_confusion_matrix_plot(
+        cm, classes,
+        f"{fusion_name}_{label_type}_finetune_fusion",
+        f"Confusion Matrix - {fusion_name} (Finetune Fusion)"
+    )
 
     ckpt_path_ft = os.path.join(RESULTS_DIR, f"{fusion_name}_finetune_fusion_best.pth")
     torch.save(model.state_dict(), ckpt_path_ft)
@@ -458,7 +488,7 @@ def run_all_fusions(fusion_configs):
     pd.DataFrame(all_rows).to_csv(summary_path, index=False)
     print(f"\nSaved TEST summary for all fusions: {summary_path}")
 
-# MAIN
+# MAIN: ONLY THE TWO LAST FUSIONS (PT2+PT3 and PT1+PT2+PT3)
 
 if __name__ == "__main__":
     fusion_configs = [
@@ -476,8 +506,7 @@ if __name__ == "__main__":
                 ("PT3_D3", os.path.join(MODELS_DIR, "PT3_D3_encoder_only.pth")),
             ],
         ),
-     
     ]
 
     run_all_fusions(fusion_configs)
-    print("Fusion-only (binary, D3) completed.")
+    print("Fusion-only (binary, D3) completed (ONLY last 2 fusions).")
